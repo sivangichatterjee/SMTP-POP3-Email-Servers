@@ -1,32 +1,186 @@
-Full name:  Sivangi Chatterjee
-SEAS login: chatter2
+# Email Server — Multithreaded SMTP & POP3 from Scratch
 
-Which features did you implement? 
-  (list features, or write 'Entire assignment')
-  Entire assignment except extra credit
+A pair of fully functional **SMTP** and **POP3** email servers built in C++ using raw TCP sockets and pthreads. The servers implement the core RFC specifications, support concurrent client connections, and work with **Mozilla Thunderbird** as a real email client. Built as part of CIS 5050: Software Systems at the University of Pennsylvania.
 
-Did you complete any extra-credit tasks? If so, which ones?
-  (list extra-credit tasks)
-  No extra credits were completed.
+---
 
-Did you personally write _all_ the code you are submitting
-(other than code from the course web page)?
-  [X] Yes
-  [ ] No
+## Overview
 
-Did you copy any code from the Internet, or from classmates?
-  [ ] Yes
-  [X] No
+The project consists of three incrementally built servers:
 
-Did you collaborate with anyone on this assignment?
-  [ ] Yes
-  [X] No
+1. **Echo Server** — A multithreaded TCP server that handles concurrent connections, buffered I/O, and graceful shutdown. Serves as the foundation for the email servers.
+2. **SMTP Server** — Accepts incoming emails from clients (like Thunderbird), parses SMTP commands (HELO, MAIL FROM, RCPT TO, DATA, etc.), and stores messages in **mbox-format** mailbox files.
+3. **POP3 Server** — Allows email clients to retrieve, list, and delete messages from mailboxes. Supports authentication, UIDL via MD5 hashing, and proper mbox parsing.
 
-Did you use any AI tool such as ChatGPT for this assignment?
-  [ ] Yes
-  [X] No
+Together, they form a complete local email system: send an email via SMTP → store it in an mbox file → retrieve it via POP3 in Thunderbird.
 
-How many hours did you spend on this assignment?
-  (list the time you spent)
+---
 
-  MS2+MS3 assignment took me almost a week of work
+## Architecture
+
+```
+┌─────────────┐          ┌──────────────┐          ┌─────────────┐
+│ Thunderbird │──SMTP───→│  SMTP Server │──writes──→│  user.mbox  │
+│ (or Telnet) │          │  (port 2500) │          │  (mailbox)  │
+└─────────────┘          └──────────────┘          └──────┬──────┘
+                                                          │
+┌─────────────┐          ┌──────────────┐                 │
+│ Thunderbird │←──POP3──│  POP3 Server │──reads───────────┘
+│ (or Telnet) │          │  (port 11000)│
+└─────────────┘          └──────────────┘
+```
+
+Both servers are multithreaded — each incoming TCP connection is handled by a dedicated pthread. Mailbox files are protected by **file-level locks** (`flock()`) for inter-process synchronization and **mutexes** for inter-thread synchronization.
+
+---
+
+## Features
+
+### Echo Server
+- Multithreaded TCP server supporting up to 100 concurrent connections
+- Proper data buffering — handles partial commands and multiple commands per `read()` call
+- Graceful SIGINT handling — sends goodbye messages, closes all sockets, joins threads
+- Debug output with `-v` flag
+
+### SMTP Server (RFC 821)
+- Full command support: `HELO`, `MAIL FROM`, `RCPT TO`, `DATA`, `RSET`, `NOOP`, `QUIT`
+- Strict command sequencing and state machine enforcement
+- Stores emails in **mbox format** with proper `From <email> <date>` separators
+- Supports multiple recipients per email
+- Case-insensitive command parsing
+- Works with Mozilla Thunderbird out of the box
+
+### POP3 Server (RFC 1939)
+- Full command support: `USER`, `PASS`, `STAT`, `LIST`, `UIDL`, `RETR`, `DELE`, `RSET`, `NOOP`, `QUIT`
+- Authentication with username/password
+- UIDL computed as **MD5 hash** of message content (using libcrypto)
+- Proper transaction/update state machine — deletions applied only on QUIT
+- Parses mbox files to identify individual messages
+- Works with Mozilla Thunderbird for inbox retrieval
+
+### Cross-Cutting
+- Thread-safe mailbox access with `flock()` + `pthread_mutex`
+- Signal handling across multiple threads (SIGINT cleanup)
+- Verbose debug logging (`-v`) with connection-level tracing
+
+---
+
+## Usage
+
+```bash
+# Compile all servers
+make
+
+# Create mailbox directory
+mkdir mailboxes
+touch mailboxes/alice.mbox
+touch mailboxes/bob.mbox
+
+# Run SMTP server (default port 2500)
+./smtp mailboxes -p 2500 -v
+
+# Run POP3 server (default port 11000)
+./pop3 mailboxes -p 11000 -v
+
+# Run echo server (default port 10000)
+./echoserver -p 10000 -v
+
+# Test with telnet
+telnet localhost 2500    # SMTP
+telnet localhost 11000   # POP3
+telnet localhost 10000   # Echo
+```
+
+### Command-Line Options
+
+| Flag | Description |
+|---|---|
+| `-p <port>` | Port number (defaults: echo=10000, SMTP=2500, POP3=11000) |
+| `-v` | Enable verbose debug output to stderr |
+| `-a` | Print author name and SEAS login, then exit |
+
+---
+
+## SMTP Session Example
+
+```
+S: 220 localhost Simple Mail Transfer Service Ready
+C: HELO example.com
+S: 250 OK
+C: MAIL FROM:<alice@localhost>
+S: 250 OK
+C: RCPT TO:<bob@localhost>
+S: 250 OK
+C: DATA
+S: 354 Start mail input; end with <CRLF>.<CRLF>
+C: Subject: Hello
+C:
+C: Hi Bob, how are you?
+C: .
+S: 250 OK
+C: QUIT
+S: 221 localhost Service closing transmission channel
+```
+
+## POP3 Session Example
+
+```
+S: +OK POP3 ready [localhost]
+C: USER bob
+S: +OK
+C: PASS cis505
+S: +OK bob's maildrop has 1 messages (strsize octets)
+C: LIST
+S: +OK 1 messages (strsize octets)
+S: 1 strsize
+S: .
+C: RETR 1
+S: +OK strsize octets
+S: Subject: Hello
+S:
+S: Hi Bob, how are you?
+S: .
+C: QUIT
+S: +OK Goodbye!
+```
+
+---
+
+## Mailbox Format (mbox)
+
+Emails are stored in standard mbox format. Each message begins with a `From ` line (note the space after "From") added by the SMTP server:
+
+```
+From <alice@localhost> Wed Mar 19 14:30:00 2026
+Subject: Hello
+From: alice@localhost
+To: bob@localhost
+
+Hi Bob, how are you?
+```
+
+The POP3 server parses these `From ` separators to identify individual messages within the mailbox file.
+
+---
+
+## Synchronization
+
+The servers handle concurrent access to mailbox files at two levels:
+
+- **Inter-process** (SMTP writing while POP3 reads): `flock()` exclusive file locks
+- **Inter-thread** (multiple SMTP threads delivering to the same recipient): `pthread_mutex` per mailbox
+
+The POP3 server acquires the lock after successful authentication and holds it through the entire transaction, releasing only after the UPDATE state completes.
+
+---
+
+## Tech Stack
+
+- **Language:** C++
+- **Networking:** POSIX TCP sockets (socket, bind, listen, accept, send, recv)
+- **Concurrency:** pthreads
+- **Synchronization:** pthread_mutex, flock()
+- **Cryptography:** OpenSSL libcrypto (MD5 for UIDL)
+- **Protocols:** SMTP (RFC 821), POP3 (RFC 1939)
+- **Build:** Make
+- **Platform:** Linux (tested with Mozilla Thunderbird on macOS/host connecting to server in container)
